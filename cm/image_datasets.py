@@ -3,7 +3,24 @@ import random
 
 from PIL import Image
 import blobfile as bf
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+    _HAVE_MPI = True
+except Exception:
+    _HAVE_MPI = False
+    class _DummyComm:
+        def __init__(self):
+            # expose both properties and methods for compatibility
+            self.rank = 0
+            self.size = 1
+        def Get_rank(self): return 0
+        def Get_size(self): return 1
+        def Barrier(self): pass
+        def bcast(self, x, root=0): return x
+        def allreduce(self, x, op=None): return x
+    class _DummyMPI:
+        COMM_WORLD = _DummyComm()
+    MPI = _DummyMPI()
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
 
