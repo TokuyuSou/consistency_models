@@ -18,6 +18,8 @@ from .nn import (
     timestep_embedding,
 )
 
+from flash_attn import flash_attn_qkvpacked_func
+
 
 class AttentionPool2d(nn.Module):
     """
@@ -341,7 +343,6 @@ class QKVFlashAttention(nn.Module):
         **kwargs,
     ) -> None:
         from einops import rearrange
-        from flash_attn.flash_attention import FlashAttention
 
         assert batch_first
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -356,20 +357,30 @@ class QKVFlashAttention(nn.Module):
         self.head_dim = self.embed_dim // num_heads
         assert self.head_dim in [16, 32, 64], "Only support head_dim == 16, 32, or 64"
 
-        self.inner_attn = FlashAttention(
-            attention_dropout=attention_dropout, **factory_kwargs
-        )
+        # self.inner_attn = FlashAttention(
+        #     attention_dropout=attention_dropout, **factory_kwargs
+        # )
         self.rearrange = rearrange
+        self.attn_dropout = attention_dropout
 
     def forward(self, qkv, attn_mask=None, key_padding_mask=None, need_weights=False):
         qkv = self.rearrange(
             qkv, "b (three h d) s -> b s three h d", three=3, h=self.num_heads
         )
-        qkv, _ = self.inner_attn(
-            qkv,
-            key_padding_mask=key_padding_mask,
-            need_weights=need_weights,
-            causal=self.causal,
+        if attn_mask is not None:
+            raise NotImplementedError("attn_mask is not supported yet.")
+        if key_padding_mask is not None:
+            raise NotImplementedError("key_padding_mask is not supported yet.")
+        if need_weights:
+            raise NotImplementedError("need_weights is not supported yet.")
+        # qkv, _ = self.inner_attn(
+        #     qkv,
+        #     key_padding_mask=key_padding_mask,
+        #     need_weights=need_weights,
+        #     causal=self.causal,
+        # )
+        qkv = flash_attn_qkvpacked_func(
+            qkv, dropout_p=self.attn_dropout, causal=self.causal
         )
         return self.rearrange(qkv, "b s h d -> b (h d) s")
 

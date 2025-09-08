@@ -1,6 +1,7 @@
 # Compiled python modules.
 *.pyc
 *.png
+*.jpg
 
 # Byte-compiled
 _pycache__/

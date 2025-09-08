@@ -14,6 +14,7 @@ import tempfile
 import warnings
 from collections import defaultdict
 from contextlib import contextmanager
+from torch.utils.tensorboard.writer import SummaryWriter
 
 DEBUG = 10
 INFO = 20
@@ -166,25 +167,18 @@ class TensorBoardOutputFormat(KVWriter):
         self.tf = tf
         self.event_pb2 = event_pb2
         self.pywrap_tensorflow = pywrap_tensorflow
-        self.writer = pywrap_tensorflow.EventsWriter(compat.as_bytes(path))
+        self.writer = SummaryWriter(log_dir=osp.abspath(dir))
 
     def writekvs(self, kvs):
-        def summary_val(k, v):
-            kwargs = {"tag": k, "simple_value": float(v)}
-            return self.tf.Summary.Value(**kwargs)
-
-        summary = self.tf.Summary(value=[summary_val(k, v) for k, v in kvs.items()])
-        event = self.event_pb2.Event(wall_time=time.time(), summary=summary)
-        event.step = (
-            self.step
-        )  # is there any reason why you'd want to specify the step?
-        self.writer.WriteEvent(event)
-        self.writer.Flush()
+        for k, v in kvs.items():
+            if isinstance(v, (int, float)):
+                self.writer.add_scalar(k, float(v), self.step)
+        self.writer.flush()
         self.step += 1
-
+        
     def close(self):
         if self.writer:
-            self.writer.Close()
+            self.writer.close()
             self.writer = None
 
 
@@ -447,7 +441,7 @@ def configure(dir=None, format_strs=None, comm=None, log_suffix=""):
         dir = os.getenv("OPENAI_LOGDIR")
     if dir is None:
         dir = osp.join(
-            tempfile.gettempdir(),
+            "/workspace/logs",
             datetime.datetime.now().strftime("openai-%Y-%m-%d-%H-%M-%S-%f"),
         )
     assert isinstance(dir, str)

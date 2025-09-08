@@ -13,7 +13,7 @@ python edm_train.py \
   --num_res_blocks 2 \
   --resblock_updown True \
   --schedule_sampler lognormal \
-  --use_fp16 False \
+  --use_fp16 True \
   --weight_decay 0.0 \
   --weight_schedule karras \
-  --data_dir /workspace/consistency_models/datasets/mnist32rgb
+  --data_dir /workspace/consistency_models/datasets/celeba32
