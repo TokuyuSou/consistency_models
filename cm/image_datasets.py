@@ -1,5 +1,6 @@
 import math
 import random
+import os
 
 from PIL import Image
 import blobfile as bf
@@ -58,9 +59,16 @@ def load_data(
     all_files = _list_image_files_recursively(data_dir)
     classes = None
     if class_cond:
-        # Assume classes are the first part of the filename,
-        # before an underscore.
-        class_names = [bf.basename(path).split("_")[0] for path in all_files]
+        class_names = []
+        for path in all_files:
+            base = bf.basename(path)
+            if "_" in base:
+                # keep backward-compat: filename prefix before underscore
+                cls = base.split("_")[0]
+            else:
+                # fallback: use parent directory name (CIFAR-10 typical layout)
+                cls = os.path.basename(os.path.dirname(path))
+            class_names.append(cls)
         sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
         classes = [sorted_classes[x] for x in class_names]
     dataset = ImageDataset(

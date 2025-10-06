@@ -19,5 +19,7 @@ setup(
         # "mpi4py",
         # "flash-attn<2",
         "pillow",
+        "tensorboard",
+        "tensorflow",
     ],
 )

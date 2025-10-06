@@ -782,6 +782,7 @@ class UNetModel(nn.Module):
 
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
+            y = y.to(th.long)
             emb = emb + self.label_emb(y)
 
         h = x.type(self.dtype)

@@ -1,6 +1,8 @@
 import copy
 import functools
 import os
+import re  # added: for parsing checkpoint steps
+import json  # added: for saving hyperparameters and summaries
 
 import blobfile as bf
 import torch as th
@@ -25,7 +27,6 @@ import numpy as np
 # 20-21 within the first ~1K steps of training.
 INITIAL_LOG_LOSS_SCALE = 20.0
 
-
 class TrainLoop:
     def __init__(
         self,
@@ -45,6 +46,8 @@ class TrainLoop:
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
+        keep_last_checkpoints=1,  # added: how many recent checkpoints (steps) to keep
+        hparams=None,  # added: pass original args (dict or argparse.Namespace)
     ):
         self.model = model
         self.diffusion = diffusion
@@ -65,6 +68,7 @@ class TrainLoop:
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
+        self.keep_last_checkpoints = keep_last_checkpoints  # added
 
         self.step = 0
         self.resume_step = 0
@@ -115,6 +119,9 @@ class TrainLoop:
             self.ddp_model = self.model
 
         self.step = self.resume_step
+
+        # added: save hyperparameters and model summary once at the start (rank 0 only)
+        self.maybe_save_run_metadata(hparams)
 
     def _load_and_sync_parameters(self):
         resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
@@ -261,7 +268,130 @@ class TrainLoop:
         # Save model parameters last to prevent race conditions where a restart
         # loads model at step N, but opt/ema state isn't saved for step N.
         save_checkpoint(0, self.mp_trainer.master_params)
+
+        # added: cleanup old checkpoints on rank 0 only
+        if (
+            dist.get_rank() == 0
+            and self.keep_last_checkpoints
+            and self.keep_last_checkpoints > 0
+        ):
+            cleanup_old_checkpoints(self.keep_last_checkpoints)
+
         dist.barrier()
+        
+    # added: helper to save hparams.json and model_summary.txt
+    def maybe_save_run_metadata(self, hparams):
+        if dist.get_rank() != 0:
+            return
+        logdir = get_blob_logdir()
+        try:
+            bf.makedirs(logdir)
+        except Exception:
+            pass
+
+        # Save hyperparameters as JSON (if not already saved)
+        hparams_path = bf.join(logdir, "hparams.json")
+        if not bf.exists(hparams_path):
+            # If user provided args, convert to dict; otherwise assemble from init values.
+            hp = None
+            if hparams is not None:
+                try:
+                    # argparse.Namespace -> dict
+                    hp = dict(vars(hparams))
+                except Exception:
+                    # Try to coerce dict-like; fallback to string-coerced dump
+                    try:
+                        hp = dict(hparams)
+                    except Exception:
+                        hp = {"value": str(hparams)}
+            else:
+                # Minimal set from constructor parameters
+                hp = {
+                    "batch_size": self.batch_size,
+                    "microbatch": self.microbatch,
+                    "lr": self.lr,
+                    "ema_rate": self.ema_rate,
+                    "log_interval": self.log_interval,
+                    "save_interval": self.save_interval,
+                    "resume_checkpoint": self.resume_checkpoint,
+                    "use_fp16": self.use_fp16,
+                    "fp16_scale_growth": self.fp16_scale_growth,
+                    "weight_decay": self.weight_decay,
+                    "lr_anneal_steps": self.lr_anneal_steps,
+                    "keep_last_checkpoints": self.keep_last_checkpoints,
+                }
+                # Optionally include training mode info if available (CMTrainLoop)
+                if hasattr(self, "training_mode"):
+                    hp["training_mode"] = getattr(self, "training_mode")
+                if hasattr(self, "total_training_steps"):
+                    hp["total_training_steps"] = getattr(self, "total_training_steps")
+
+            try:
+                with bf.BlobFile(hparams_path, "wb") as f:
+                    f.write(
+                        json.dumps(hp, indent=2, sort_keys=True, default=str).encode(
+                            "utf-8"
+                        )
+                    )
+            except Exception:
+                pass
+
+        # Save model structure and parameter summary (if not already saved)
+        summary_path = bf.join(logdir, "model_summary.txt")
+        if not bf.exists(summary_path):
+            try:
+                lines = []
+                lines.append("Model architecture:\n")
+                lines.append(str(self.model))
+                # Pretty-print parameter table with aligned columns
+                lines.append("\n\nParameter summary:\n")
+                rows = []
+                total_params = 0
+                trainable_params = 0
+                for name, p in self.model.named_parameters():
+                    num = p.numel()
+                    total_params += num
+                    if p.requires_grad:
+                        trainable_params += num
+                    rows.append((
+                        name,
+                        str(tuple(p.shape)),
+                        str(num),
+                        "True" if p.requires_grad else "False",
+                    ))
+                headers = ("name", "shape", "#params", "trainable")
+                # compute column widths
+                widths = [
+                    max(len(headers[i]), max((len(r[i]) for r in rows), default=0))
+                    for i in range(4)
+                ]
+                def fmt_row(cols):
+                    # left align text columns, right align numeric column
+                    return (
+                        cols[0].ljust(widths[0]) + "  |  " +
+                        cols[1].ljust(widths[1]) + "  |  " +
+                        cols[2].rjust(widths[2]) + "  |  " +
+                        cols[3].ljust(widths[3]) + "\n"
+                    )
+                # header + separator
+                lines.append(fmt_row(headers))
+                lines.append(
+                    f"{'-'*widths[0]}--+--{'-'*widths[1]}--+--{'-'*widths[2]}--+--{'-'*widths[3]}\n"
+                )
+                # rows
+                for r in rows:
+                    lines.append(fmt_row(r))
+                    
+                # totals
+                lines.append("\nTotals:\n")
+                lines.append(f"total_params     : {total_params}\n")
+                lines.append(f"trainable_params : {trainable_params}\n")
+                lines.append(f"non_trainable    : {total_params - trainable_params}\n")
+
+                with bf.BlobFile(summary_path, "wb") as f:
+                    f.write("".join(lines).encode("utf-8"))
+            except Exception:
+                pass
 
 
 class CMTrainLoop(TrainLoop):
@@ -274,9 +404,10 @@ class CMTrainLoop(TrainLoop):
         training_mode,
         ema_scale_fn,
         total_training_steps,
+        hparams=None,  # added: pass original args (dict or argparse.Namespace)
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__(hparams=hparams, **kwargs)
         self.training_mode = training_mode
         self.ema_scale_fn = ema_scale_fn
         self.target_model = target_model
@@ -316,6 +447,9 @@ class CMTrainLoop(TrainLoop):
                     self.step = 0
             else:
                 self.step = self.global_step % self.lr_anneal_steps
+                
+        # added: save hyperparameters and model summary once at the start (rank 0 only)
+        self.maybe_save_run_metadata(hparams)
 
     def _load_and_sync_target_parameters(self):
         resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
@@ -557,6 +691,15 @@ class CMTrainLoop(TrainLoop):
         # Save model parameters last to prevent race conditions where a restart
         # loads model at step N, but opt/ema state isn't saved for step N.
         save_checkpoint(0, self.mp_trainer.master_params)
+
+        # added: cleanup old checkpoints on rank 0 only
+        if (
+            dist.get_rank() == 0
+            and self.keep_last_checkpoints
+            and self.keep_last_checkpoints > 0
+        ):
+            cleanup_old_checkpoints(self.keep_last_checkpoints)
+
         dist.barrier()
 
     def log_step(self):
@@ -600,6 +743,60 @@ def find_ema_checkpoint(main_checkpoint, step, rate):
     if bf.exists(path):
         return path
     return None
+
+
+def cleanup_old_checkpoints(keep_last):
+    """
+    Delete older checkpoints, keeping only the most recent 'keep_last' steps.
+    A "step" is determined from filenames:
+      - model{step}.pt
+      - opt{step}.pt
+      - ema_{rate}_{step}.pt
+      - target_model{step}.pt
+      - teacher_model{step}.pt
+    """
+    logdir = get_blob_logdir()
+    try:
+        files = bf.listdir(logdir)
+    except Exception:
+        return
+
+    # Match supported checkpoint files and capture the 6-digit step number.
+    pat = re.compile(
+        r"^(?:model|opt|ema_[^_]+_|target_model|teacher_model)(\d{6})\.pt$"
+    )
+
+    # Group files by step
+    step_to_files = {}
+    for fname in files:
+        m = pat.match(fname)
+        if not m:
+            continue
+        step = int(m.group(1))
+        step_to_files.setdefault(step, []).append(bf.join(logdir, fname))
+
+    if not step_to_files:
+        return
+
+    steps_sorted = sorted(step_to_files.keys())
+    if len(steps_sorted) <= keep_last:
+        return
+
+    to_delete_steps = steps_sorted[:-keep_last]
+    for s in to_delete_steps:
+        for path in step_to_files[s]:
+            try:
+                # Try blobfile removal if available; fall back to os.remove.
+                if hasattr(bf, "remove"):
+                    bf.remove(path)  # type: ignore[attr-defined]
+                elif hasattr(bf, "rm"):
+                    bf.rm(path)  # type: ignore[attr-defined]
+                else:
+                    os.remove(path)
+                logger.log(f"deleted old checkpoint: {path}")
+            except Exception:
+                # Ignore delete errors to keep training robust.
+                pass
 
 
 def log_loss_dict(diffusion, ts, losses):

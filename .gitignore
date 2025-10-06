@@ -3,6 +3,9 @@
 *.png
 *.jpg
 
+env/
+cifar-10-batches-py/
+
 # Byte-compiled
 _pycache__/
 .cache/
